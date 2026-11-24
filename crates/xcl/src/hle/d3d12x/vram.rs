@@ -371,6 +371,33 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        // Mixed packed mip tails need explicit NULL mapping on some drivers.
+        let desc = res.GetDesc();
+        if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || desc.DepthOrArraySize == 1 {
+            let mut dev: Option<ID3D12Device> = None;
+            if res.GetDevice(&mut dev).is_ok() {
+                if let Some(dev) = dev {
+                    let mut packed = D3D12_PACKED_MIP_INFO::default();
+                    dev.GetResourceTiling(res, None, Some(&mut packed), None, None, 0, std::ptr::null_mut());
+                    let n = packed.NumTilesForPackedMips;
+                    if packed.NumStandardMips > 0 && packed.NumPackedMips > 0 && n > 0 {
+                        let coord = D3D12_TILED_RESOURCE_COORDINATE {
+                            Subresource: packed.NumStandardMips as u32,
+                            ..Default::default()
+                        };
+                        let region = D3D12_TILE_REGION_SIZE {
+                            NumTiles: n,
+                            UseBox: false.into(),
+                            ..Default::default()
+                        };
+                        self.queue.UpdateTileMappings(
+                            res, 1, Some(&coord), Some(&region), None, 1,
+                            Some(&flag), None, Some(&n), D3D12_TILE_MAPPING_FLAG_NONE
+                        );
+                    }
+                }
+            }
+        }
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
     }
