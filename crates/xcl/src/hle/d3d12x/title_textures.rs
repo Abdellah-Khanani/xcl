@@ -1367,6 +1367,13 @@ mod tests {
     /// chains (including packed mips), cubemap arrays (`extra_pages`) and 3D volumes upload intact.
     #[test]
     fn placed_title_textures_share_vram_and_preserve_pixels() {
+        placed_title_textures_impl(false);
+        // Run this after the page-count checks: idle pages can be reclaimed.
+        placed_title_textures_impl(true);
+    }
+
+
+    fn placed_title_textures_impl(probe_unmap: bool) {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
         let _guard = TEST_LOCK.lock().unwrap();
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -1485,6 +1492,63 @@ mod tests {
             // with zero additional page growth after the 16 MiB working set is covered.
             let dev_key = dev.as_raw() as usize;
             let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
+            if probe_unmap {
+                let ad = adapter.GetDesc1().unwrap();
+                println!("ADAPTER: {}", String::from_utf16_lossy(&ad.Description).trim_end_matches(char::from(0)));
+                if opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_3.0 {
+                    println!("SKIPPED packed_mips_unmap_and_remap: tiled tier < 3");
+                    uma.free(base);
+                    return;
+                }
+                let original_base = base;
+                let base = uma.alloc(pool_size, 0x1_0000).map(|p| p as usize).expect("disjoint UMA probe block");
+                let volume = console_desc(4, 64, 64, 64, 4, 28, 0x105);
+                let old = place_tex(base, &volume);
+                let mut packed = D3D12_PACKED_MIP_INFO::default();
+                dev.GetResourceTiling(&old, None, Some(&mut packed), None, None, 0, std::ptr::null_mut());
+                if packed.NumStandardMips == 0 || packed.NumPackedMips == 0 {
+                    println!("SKIPPED packed_mips_unmap_and_remap: no mixed mip layout");
+                    drop(old);
+                    uma.free(base);
+                    uma.free(original_base);
+                    return;
+                }
+                assert_eq!(old.GetDesc().Layout, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+                write_tiled(base, &volume, 0x71);
+                refresh(queue.as_raw());
+                let expected = subresources(base, &xg::Texture::new(&volume).unwrap());
+                for (i, e) in expected.iter().enumerate() {
+                    assert!(e.data.iter().any(|&b| b != 0));
+                    assert!(read_sub(&old, i as u32) == e.data, "initial mip {i} mismatch");
+                }
+                let cover_desc = console_desc(3, 64, 64, 1, 1, 28, 0x105);
+                let cover = place_tex(base, &cover_desc);
+                write_tiled(base, &cover_desc, 0xC4);
+                refresh(queue.as_raw());
+                assert!(read_sub(&cover, 0) == subresources(base, &xg::Texture::new(&cover_desc).unwrap())[0].data);
+                let mut stale = 0usize;
+                for i in 0..expected.len() {
+                    let bytes = read_sub(&old, i as u32);
+                    let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+                    println!("UNMAPPED_MIP: index={i} nonzero={nonzero}");
+                    stale += nonzero;
+                }
+                drop(cover);
+                write_tiled(base, &volume, 0xD4);
+                refresh(queue.as_raw());
+                let restored = subresources(base, &xg::Texture::new(&volume).unwrap());
+                for (i, e) in restored.iter().enumerate() {
+                    assert!(read_sub(&old, i as u32) == e.data, "remapped mip {i} mismatch");
+                }
+                println!("REMAP_PASS");
+                drop(old);
+                uma.free(base);
+                uma.free(original_base);
+                assert_eq!(stale, 0, "unmapped volume retains nonzero bytes");
+                println!("PACKED_UNMAP_PASS");
+                return;
+            }
+
             let stream_desc = console_desc(3, 512, 512, 1, 1, 28, 0x109); // 64KB_S, 1 MiB
             let (pages0, vram0, kept0) = (dev_pages(), local_vram(), counts().0);
             let mut leaked_refs = Vec::with_capacity(512);
